@@ -1,5 +1,7 @@
 //! Connection tests
 
+use std::{collections::HashSet, net::SocketAddr, time::Duration};
+
 use alloy_node_bindings::Geth;
 use alloy_provider::{ext::AdminApi, ProviderBuilder};
 use futures::StreamExt;
@@ -8,7 +10,8 @@ use reth_eth_wire::{DisconnectReason, HeadersDirection};
 use reth_net_banlist::BanList;
 use reth_network::{
     test_utils::{enr_to_peer_id, NetworkEventStream, PeerConfig, Testnet, GETH_TIMEOUT},
-    NetworkConfigBuilder, NetworkEvent, NetworkEvents, NetworkManager, PeersConfig,
+    BlockDownloaderProvider, NetworkConfigBuilder, NetworkEvent, NetworkEventListenerProvider,
+    NetworkManager, PeersConfig,
 };
 use reth_network_api::{NetworkInfo, Peers, PeersInfo};
 use reth_network_p2p::{
@@ -19,7 +22,6 @@ use reth_network_peers::{mainnet_nodes, NodeRecord, TrustedPeer};
 use reth_provider::test_utils::NoopProvider;
 use reth_transaction_pool::test_utils::testing_pool;
 use secp256k1::SecretKey;
-use std::{collections::HashSet, net::SocketAddr, time::Duration};
 use tokio::task;
 use url::Host;
 
@@ -707,4 +709,34 @@ async fn test_connect_many() {
     for peer in handle.peers() {
         assert_eq!(peer.network().num_connected_peers(), 4);
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_disconnect_then_connect() {
+    reth_tracing::init_test_tracing();
+
+    let net = Testnet::create(2).await;
+
+    net.for_each(|peer| assert_eq!(0, peer.num_peers()));
+
+    let mut handles = net.handles();
+    let handle0 = handles.next().unwrap();
+    let handle1 = handles.next().unwrap();
+
+    drop(handles);
+    let _handle = net.spawn();
+
+    let mut listener0 = NetworkEventStream::new(handle0.event_listener());
+    handle0.add_peer(*handle1.peer_id(), handle1.local_addr());
+    let peer = listener0.next_session_established().await.unwrap();
+    assert_eq!(peer, *handle1.peer_id());
+
+    handle0.disconnect_peer(*handle1.peer_id());
+
+    let (peer, _) = listener0.next_session_closed().await.unwrap();
+    assert_eq!(peer, *handle1.peer_id());
+
+    handle0.connect_peer(*handle1.peer_id(), handle1.local_addr());
+    let peer = listener0.next_session_established().await.unwrap();
+    assert_eq!(peer, *handle1.peer_id());
 }

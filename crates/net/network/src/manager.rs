@@ -29,16 +29,14 @@ use std::{
 
 use futures::{Future, StreamExt};
 use parking_lot::Mutex;
-use reth_eth_wire::{
-    capability::{Capabilities, CapabilityMessage},
-    DisconnectReason, EthVersion, Status,
-};
+use reth_eth_wire::{capability::CapabilityMessage, Capabilities, DisconnectReason};
 use reth_fs_util::{self as fs, FsPathError};
 use reth_metrics::common::mpsc::UnboundedMeteredSender;
-use reth_network_api::{EthProtocolInfo, NetworkStatus, PeerInfo};
+use reth_network_api::{
+    test_utils::PeersHandle, EthProtocolInfo, NetworkEvent, NetworkStatus, PeerInfo, PeerRequest,
+};
 use reth_network_peers::{NodeRecord, PeerId};
 use reth_network_types::ReputationChangeKind;
-use reth_primitives::ForkId;
 use reth_storage_api::BlockNumReader;
 use reth_tasks::shutdown::GracefulShutdown;
 use reth_tokio_util::EventSender;
@@ -55,10 +53,10 @@ use crate::{
     eth_requests::IncomingEthRequest,
     import::{BlockImport, BlockImportOutcome, BlockValidation},
     listener::ConnectionListener,
-    message::{NewBlockMessage, PeerMessage, PeerRequest, PeerRequestSender},
+    message::{NewBlockMessage, PeerMessage},
     metrics::{DisconnectMetrics, NetworkMetrics, NETWORK_POOL_TRANSACTIONS_SCOPE},
     network::{NetworkHandle, NetworkHandleMessage},
-    peers::{PeerAddr, PeersHandle, PeersManager},
+    peers::PeersManager,
     poll_nested_stream_with_budget,
     protocol::IntoRlpxSubProtocol,
     session::SessionManager,
@@ -231,6 +229,7 @@ impl NetworkManager {
         // need to retrieve the addr here since provided port could be `0`
         let local_peer_id = discovery.local_id();
         let discv4 = discovery.discv4();
+        let discv5 = discovery.discv5();
 
         let num_active_peers = Arc::new(AtomicUsize::new(0));
 
@@ -268,6 +267,7 @@ impl NetworkManager {
             Arc::new(AtomicU64::new(chain_spec.chain.id())),
             tx_gossip_disabled,
             discv4,
+            discv5,
             event_sender.clone(),
         );
 
@@ -589,6 +589,9 @@ impl NetworkManager {
             }
             NetworkHandleMessage::DisconnectPeer(peer_id, reason) => {
                 self.swarm.sessions_mut().disconnect(peer_id, reason);
+            }
+            NetworkHandleMessage::ConnectPeer(peer_id, kind, addr) => {
+                self.swarm.state_mut().add_and_connect(peer_id, kind, addr);
             }
             NetworkHandleMessage::SetNetworkState(net_state) => {
                 // Sets network connection state between Active and Hibernate.
@@ -1043,67 +1046,6 @@ impl Future for NetworkManager {
 
         Poll::Pending
     }
-}
-
-/// (Non-exhaustive) Events emitted by the network that are of interest for subscribers.
-///
-/// This includes any event types that may be relevant to tasks, for metrics, keep track of peers
-/// etc.
-#[derive(Debug, Clone)]
-pub enum NetworkEvent {
-    /// Closed the peer session.
-    SessionClosed {
-        /// The identifier of the peer to which a session was closed.
-        peer_id: PeerId,
-        /// Why the disconnect was triggered
-        reason: Option<DisconnectReason>,
-    },
-    /// Established a new session with the given peer.
-    SessionEstablished {
-        /// The identifier of the peer to which a session was established.
-        peer_id: PeerId,
-        /// The remote addr of the peer to which a session was established.
-        remote_addr: SocketAddr,
-        /// The client version of the peer to which a session was established.
-        client_version: Arc<str>,
-        /// Capabilities the peer announced
-        capabilities: Arc<Capabilities>,
-        /// A request channel to the session task.
-        messages: PeerRequestSender,
-        /// The status of the peer to which a session was established.
-        status: Arc<Status>,
-        /// negotiated eth version of the session
-        version: EthVersion,
-    },
-    /// Event emitted when a new peer is added
-    PeerAdded(PeerId),
-    /// Event emitted when a new peer is removed
-    PeerRemoved(PeerId),
-}
-
-/// Represents events related to peer discovery in the network.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DiscoveredEvent {
-    /// Indicates that a new peer has been discovered and queued for potential connection.
-    ///
-    /// This event is generated when the system becomes aware of a new peer
-    /// but hasn't yet established a connection.
-    ///
-    /// # Fields
-    ///
-    /// * `peer_id` - The unique identifier of the discovered peer.
-    /// * `addr` - The network address of the discovered peer.
-    /// * `fork_id` - An optional identifier for the fork that this peer is associated with. `None`
-    ///   if the peer is not associated with a specific fork.
-    EventQueued {
-        /// The unique identifier of the discovered peer.
-        peer_id: PeerId,
-        /// The network address of the discovered peer.
-        addr: PeerAddr,
-        /// An optional identifier for the fork that this peer is associated with.
-        /// `None` if the peer is not associated with a specific fork.
-        fork_id: Option<ForkId>,
-    },
 }
 
 #[derive(Debug, Default)]

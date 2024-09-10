@@ -1,9 +1,7 @@
 use reth_chainspec::MAINNET;
 use reth_db::{
     tables,
-    test_utils::{
-        create_test_rw_db, create_test_rw_db_with_path, create_test_static_files_dir, TempDatabase,
-    },
+    test_utils::{create_test_rw_db, create_test_rw_db_with_path, create_test_static_files_dir},
     DatabaseEnv,
 };
 use reth_db_api::{
@@ -21,17 +19,18 @@ use reth_primitives::{
 };
 use reth_provider::{
     providers::{StaticFileProvider, StaticFileProviderRWRefMut, StaticFileWriter},
+    test_utils::MockNodeTypesWithDB,
     HistoryWriter, ProviderError, ProviderFactory, StaticFileProviderFactory,
 };
 use reth_storage_errors::provider::ProviderResult;
 use reth_testing_utils::generators::ChangeSet;
-use std::{collections::BTreeMap, path::Path, sync::Arc};
+use std::{collections::BTreeMap, path::Path};
 use tempfile::TempDir;
 
 /// Test database that is used for testing stage implementations.
 #[derive(Debug)]
 pub struct TestStageDB {
-    pub factory: ProviderFactory<Arc<TempDatabase<DatabaseEnv>>>,
+    pub factory: ProviderFactory<MockNodeTypesWithDB>,
     pub temp_static_files_dir: TempDir,
 }
 
@@ -282,10 +281,10 @@ impl TestStageDB {
                         segment_header.expected_block_start() == 0
                     {
                         for block in 0..block.number {
-                            txs_writer.increment_block(StaticFileSegment::Transactions, block)?;
+                            txs_writer.increment_block(block)?;
                         }
                     }
-                    txs_writer.increment_block(StaticFileSegment::Transactions, block.number)?;
+                    txs_writer.increment_block(block.number)?;
                 }
                 res
             })?;
@@ -349,7 +348,7 @@ impl TestStageDB {
                 let provider = self.factory.static_file_provider();
                 let mut writer = provider.latest_writer(StaticFileSegment::Receipts)?;
                 let res = receipts.into_iter().try_for_each(|(block_num, receipts)| {
-                    writer.increment_block(StaticFileSegment::Receipts, block_num)?;
+                    writer.increment_block(block_num)?;
                     writer.append_receipts(receipts.into_iter().map(Ok))?;
                     Ok(())
                 });

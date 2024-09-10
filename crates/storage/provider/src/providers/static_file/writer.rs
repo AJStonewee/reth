@@ -2,10 +2,10 @@ use super::{
     manager::StaticFileProviderInner, metrics::StaticFileProviderMetrics, StaticFileProvider,
 };
 use crate::providers::static_file::metrics::StaticFileProviderOperation;
-use dashmap::mapref::one::RefMut;
+use parking_lot::{lock_api::RwLockWriteGuard, RawRwLock, RwLock};
 use reth_codecs::Compact;
 use reth_db_api::models::CompactU256;
-use reth_nippy_jar::{ConsistencyFailStrategy, NippyJar, NippyJarError, NippyJarWriter};
+use reth_nippy_jar::{NippyJar, NippyJarError, NippyJarWriter};
 use reth_primitives::{
     static_file::{find_fixed_range, SegmentHeader, SegmentRangeInclusive},
     BlockHash, BlockNumber, Header, Receipt, StaticFileSegment, TransactionSignedNoHash, TxNumber,
@@ -20,8 +20,68 @@ use std::{
 };
 use tracing::debug;
 
-/// Mutable reference to a dashmap element of [`StaticFileProviderRW`].
-pub type StaticFileProviderRWRefMut<'a> = RefMut<'a, StaticFileSegment, StaticFileProviderRW>;
+/// Static file writers for every known [`StaticFileSegment`].
+///
+/// WARNING: Trying to use more than one writer for the same segment type **will result in a
+/// deadlock**.
+#[derive(Debug, Default)]
+pub(crate) struct StaticFileWriters {
+    headers: RwLock<Option<StaticFileProviderRW>>,
+    transactions: RwLock<Option<StaticFileProviderRW>>,
+    receipts: RwLock<Option<StaticFileProviderRW>>,
+}
+
+impl StaticFileWriters {
+    pub(crate) fn get_or_create(
+        &self,
+        segment: StaticFileSegment,
+        create_fn: impl FnOnce() -> ProviderResult<StaticFileProviderRW>,
+    ) -> ProviderResult<StaticFileProviderRWRefMut<'_>> {
+        let mut write_guard = match segment {
+            StaticFileSegment::Headers => self.headers.write(),
+            StaticFileSegment::Transactions => self.transactions.write(),
+            StaticFileSegment::Receipts => self.receipts.write(),
+        };
+
+        if write_guard.is_none() {
+            *write_guard = Some(create_fn()?);
+        }
+
+        Ok(StaticFileProviderRWRefMut(write_guard))
+    }
+
+    pub(crate) fn commit(&self) -> ProviderResult<()> {
+        for writer_lock in [&self.headers, &self.transactions, &self.receipts] {
+            let mut writer = writer_lock.write();
+            if let Some(writer) = writer.as_mut() {
+                writer.commit()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Mutable reference to a [`StaticFileProviderRW`] behind a [`RwLockWriteGuard`].
+#[derive(Debug)]
+pub struct StaticFileProviderRWRefMut<'a>(
+    pub(crate) RwLockWriteGuard<'a, RawRwLock, Option<StaticFileProviderRW>>,
+);
+
+impl<'a> std::ops::DerefMut for StaticFileProviderRWRefMut<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // This is always created by [`StaticFileWriters::get_or_create`]
+        self.0.as_mut().expect("static file writer provider should be init")
+    }
+}
+
+impl<'a> std::ops::Deref for StaticFileProviderRWRefMut<'a> {
+    type Target = StaticFileProviderRW;
+
+    fn deref(&self) -> &Self::Target {
+        // This is always created by [`StaticFileWriters::get_or_create`]
+        self.0.as_ref().expect("static file writer provider should be init")
+    }
+}
 
 #[derive(Debug)]
 /// Extends `StaticFileProvider` with writing capabilities
@@ -45,6 +105,9 @@ pub struct StaticFileProviderRW {
 
 impl StaticFileProviderRW {
     /// Creates a new [`StaticFileProviderRW`] for a [`StaticFileSegment`].
+    ///
+    /// Before use, transaction based segments should ensure the block end range is the expected
+    /// one, and heal if not. For more check `Self::ensure_end_range_consistency`.
     pub fn new(
         segment: StaticFileSegment,
         block: BlockNumber,
@@ -52,14 +115,18 @@ impl StaticFileProviderRW {
         metrics: Option<Arc<StaticFileProviderMetrics>>,
     ) -> ProviderResult<Self> {
         let (writer, data_path) = Self::open(segment, block, reader.clone(), metrics.clone())?;
-        Ok(Self {
+        let mut writer = Self {
             writer,
             data_path,
             buf: Vec::with_capacity(100),
             reader,
             metrics,
             prune_on_commit: None,
-        })
+        };
+
+        writer.ensure_end_range_consistency()?;
+
+        Ok(writer)
     }
 
     fn open(
@@ -90,14 +157,7 @@ impl StaticFileProviderRW {
             Err(err) => return Err(err),
         };
 
-        let reader = Self::upgrade_provider_to_strong_reference(&reader);
-        let access = if reader.is_read_only() {
-            ConsistencyFailStrategy::ThrowError
-        } else {
-            ConsistencyFailStrategy::Heal
-        };
-
-        let result = match NippyJarWriter::new(jar, access) {
+        let result = match NippyJarWriter::new(jar) {
             Ok(writer) => Ok((writer, path)),
             Err(NippyJarError::FrozenJar) => {
                 // This static file has been frozen, so we should
@@ -117,33 +177,15 @@ impl StaticFileProviderRW {
         Ok(result)
     }
 
-    /// Checks the consistency of the file and heals it if necessary and `read_only` is set to
-    /// false. If the check fails, it will return an error.
+    /// If a file level healing happens, we need to update the end range on the
+    /// [`SegmentHeader`].
     ///
-    /// If healing does happen, it will update the end range on the [`SegmentHeader`]. However, for
-    /// transaction based segments, the block end range has to be found and healed externally.
+    /// However, for transaction based segments, the block end range has to be found and healed
+    /// externally.
     ///
-    /// Check [`NippyJarWriter::ensure_file_consistency`] for more on healing.
-    pub fn ensure_file_consistency(&mut self, read_only: bool) -> ProviderResult<()> {
-        let inconsistent_error = || {
-            ProviderError::NippyJar(
-                "Inconsistent state found. Restart the node to heal.".to_string(),
-            )
-        };
-
-        let check_mode = if read_only {
-            ConsistencyFailStrategy::ThrowError
-        } else {
-            ConsistencyFailStrategy::Heal
-        };
-
-        self.writer.ensure_file_consistency(check_mode).map_err(|error| {
-            if matches!(error, NippyJarError::InconsistentState) {
-                return inconsistent_error()
-            }
-            ProviderError::NippyJar(error.to_string())
-        })?;
-
+    /// Check [`reth_nippy_jar::NippyJarChecker`] &
+    /// [`NippyJarWriter`] for more on healing.
+    fn ensure_end_range_consistency(&mut self) -> ProviderResult<()> {
         // If we have lost rows (in this run or previous), we need to update the [SegmentHeader].
         let expected_rows = if self.user_header().segment().is_headers() {
             self.user_header().block_len().unwrap_or_default()
@@ -152,9 +194,6 @@ impl StaticFileProviderRW {
         };
         let pruned_rows = expected_rows - self.writer.rows() as u64;
         if pruned_rows > 0 {
-            if read_only {
-                return Err(inconsistent_error())
-            }
             self.user_header_mut().prune(pruned_rows);
         }
 
@@ -270,9 +309,10 @@ impl StaticFileProviderRW {
     /// Returns the current [`BlockNumber`] as seen in the static file.
     pub fn increment_block(
         &mut self,
-        segment: StaticFileSegment,
         expected_block_number: BlockNumber,
     ) -> ProviderResult<BlockNumber> {
+        let segment = self.writer.user_header().segment();
+
         self.check_next_block_number(expected_block_number, segment)?;
 
         let start = Instant::now();
@@ -476,7 +516,7 @@ impl StaticFileProviderRW {
 
         debug_assert!(self.writer.user_header().segment() == StaticFileSegment::Headers);
 
-        let block_number = self.increment_block(StaticFileSegment::Headers, header.number)?;
+        let block_number = self.increment_block(header.number)?;
 
         self.append_column(header)?;
         self.append_column(CompactU256::from(total_difficulty))?;

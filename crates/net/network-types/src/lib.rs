@@ -14,14 +14,19 @@
 
 /// Types related to peering.
 pub mod peers;
-pub use peers::{
-    reputation::{Reputation, ReputationChangeKind, ReputationChangeWeights},
-    ConnectionsConfig, PeersConfig,
-};
-
 pub mod session;
-pub use session::{SessionLimits, SessionsConfig};
 
 /// [`BackoffKind`] definition.
 mod backoff;
+
+pub use peers::reputation::{Reputation, ReputationChangeKind, ReputationChangeWeights};
+
 pub use backoff::BackoffKind;
+pub use peers::{
+    addr::PeerAddr,
+    kind::PeerKind,
+    reputation::{is_banned_reputation, ReputationChangeOutcome, DEFAULT_REPUTATION},
+    state::PeerConnectionState,
+    ConnectionsConfig, Peer, PeersConfig,
+};
+pub use session::{SessionLimits, SessionsConfig};

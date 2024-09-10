@@ -1,17 +1,13 @@
-use once_cell::sync::Lazy;
 use reth_chainspec::{Chain, ChainSpec, HOLESKY, MAINNET};
-use reth_db_api::database::Database;
-use reth_primitives::{
-    constants::EMPTY_ROOT_HASH, keccak256, Account, Address, Bytes, StorageEntry, B256, U256,
-};
-use reth_provider::{
-    test_utils::create_test_provider_factory, HashingWriter, ProviderFactory, TrieWriter,
-};
-use reth_storage_errors::provider::ProviderResult;
-use reth_trie::{proof::Proof, Nibbles, StateRoot};
+use reth_primitives::{constants::EMPTY_ROOT_HASH, keccak256, Account, Address, Bytes, B256, U256};
+use reth_provider::test_utils::{create_test_provider_factory, insert_genesis};
+use reth_trie::{proof::Proof, Nibbles};
 use reth_trie_common::{AccountProof, StorageProof};
-use reth_trie_db::{DatabaseProof, DatabaseStateRoot};
-use std::{str::FromStr, sync::Arc};
+use reth_trie_db::DatabaseProof;
+use std::{
+    str::FromStr,
+    sync::{Arc, LazyLock},
+};
 
 /*
     World State (sampled from <https://ethereum.stackexchange.com/questions/268/ethereum-block-architecture/6413#6413>)
@@ -24,7 +20,7 @@ use std::{str::FromStr, sync::Arc};
 
     All expected testspec results were obtained from querying proof RPC on the running geth instance `geth init crates/trie/testdata/proof-genesis.json && geth --http`.
 */
-static TEST_SPEC: Lazy<Arc<ChainSpec>> = Lazy::new(|| {
+static TEST_SPEC: LazyLock<Arc<ChainSpec>> = LazyLock::new(|| {
     ChainSpec {
         chain: Chain::from_id(12345),
         genesis: serde_json::from_str(include_str!("../../trie/testdata/proof-genesis.json"))
@@ -36,41 +32,6 @@ static TEST_SPEC: Lazy<Arc<ChainSpec>> = Lazy::new(|| {
 
 fn convert_to_proof<'a>(path: impl IntoIterator<Item = &'a str>) -> Vec<Bytes> {
     path.into_iter().map(Bytes::from_str).collect::<Result<Vec<_>, _>>().unwrap()
-}
-
-fn insert_genesis<DB: Database>(
-    provider_factory: &ProviderFactory<DB>,
-    chain_spec: Arc<ChainSpec>,
-) -> ProviderResult<B256> {
-    let provider = provider_factory.provider_rw()?;
-
-    // Hash accounts and insert them into hashing table.
-    let genesis = chain_spec.genesis();
-    let alloc_accounts = genesis
-        .alloc
-        .iter()
-        .map(|(addr, account)| (*addr, Some(Account::from_genesis_account(account))));
-    provider.insert_account_for_hashing(alloc_accounts).unwrap();
-
-    let alloc_storage = genesis.alloc.clone().into_iter().filter_map(|(addr, account)| {
-        // Only return `Some` if there is storage.
-        account.storage.map(|storage| {
-            (
-                addr,
-                storage.into_iter().map(|(key, value)| StorageEntry { key, value: value.into() }),
-            )
-        })
-    });
-    provider.insert_storage_for_hashing(alloc_storage)?;
-
-    let (root, updates) = StateRoot::from_tx(provider.tx_ref())
-        .root_with_updates()
-        .map_err(Into::<reth_db::DatabaseError>::into)?;
-    provider.write_trie_updates(&updates).unwrap();
-
-    provider.commit()?;
-
-    Ok(root)
 }
 
 #[test]

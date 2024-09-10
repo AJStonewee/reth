@@ -27,11 +27,11 @@
     html_favicon_url = "https://avatars0.githubusercontent.com/u/97369466?s=256",
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
+#![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
 pub mod cli;
 pub mod commands;
-mod macros;
 
 /// Re-exported utils.
 pub mod utils {
@@ -90,6 +90,11 @@ pub mod dirs {
     pub use reth_node_core::dirs::*;
 }
 
+/// Re-exported from `reth_chainspec`
+pub mod chainspec {
+    pub use reth_chainspec::*;
+}
+
 /// Re-exported from `reth_provider`.
 pub mod providers {
     pub use reth_provider::*;
@@ -107,6 +112,11 @@ pub mod beacon_consensus {
 /// Re-exported from `reth_blockchain_tree`.
 pub mod blockchain_tree {
     pub use reth_blockchain_tree::*;
+}
+
+/// Re-exported from `reth_consensus`.
+pub mod consensus {
+    pub use reth_consensus::*;
 }
 
 /// Re-exported from `reth_consensus_common`.
@@ -127,7 +137,9 @@ pub mod tasks {
 /// Re-exported from `reth_network`.
 pub mod network {
     pub use reth_network::*;
-    pub use reth_network_api::{noop, NetworkInfo, PeerKind, Peers, PeersInfo};
+    pub use reth_network_api::{
+        noop, test_utils::PeersHandleProvider, NetworkInfo, Peers, PeersInfo,
+    };
 }
 
 /// Re-exported from `reth_transaction_pool`.

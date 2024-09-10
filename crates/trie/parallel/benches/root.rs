@@ -10,10 +10,9 @@ use reth_provider::{
 };
 use reth_tasks::pool::BlockingTaskPool;
 use reth_trie::{
-    hashed_cursor::{DatabaseHashedCursorFactory, HashedPostStateCursorFactory},
-    HashedPostState, HashedStorage, StateRoot,
+    hashed_cursor::HashedPostStateCursorFactory, HashedPostState, HashedStorage, StateRoot,
 };
-use reth_trie_db::DatabaseStateRoot;
+use reth_trie_db::{DatabaseHashedCursorFactory, DatabaseStateRoot};
 use reth_trie_parallel::{async_root::AsyncStateRoot, parallel_root::ParallelStateRoot};
 use std::collections::HashMap;
 
@@ -99,14 +98,14 @@ fn generate_test_data(size: usize) -> (HashedPostState, HashedPostState) {
     .unwrap()
     .current();
 
-    let keys = db_state.keys().cloned().collect::<Vec<_>>();
+    let keys = db_state.keys().copied().collect::<Vec<_>>();
     let keys_to_update = subsequence(keys, size / 2).new_tree(&mut runner).unwrap().current();
 
     let updated_storages = keys_to_update
         .into_iter()
         .map(|address| {
             let (_, storage) = db_state.get(&address).unwrap();
-            let slots = storage.keys().cloned().collect::<Vec<_>>();
+            let slots = storage.keys().copied().collect::<Vec<_>>();
             let slots_to_update =
                 subsequence(slots, storage_size / 2).new_tree(&mut runner).unwrap().current();
             (

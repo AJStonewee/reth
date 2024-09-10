@@ -2,12 +2,14 @@ use crate::{
     in_memory::ExecutedBlock, CanonStateNotification, CanonStateNotifications,
     CanonStateSubscriptions,
 };
+use alloy_signer::SignerSync;
+use alloy_signer_local::PrivateKeySigner;
 use rand::{thread_rng, Rng};
-use reth_chainspec::ChainSpec;
+use reth_chainspec::{ChainSpec, EthereumHardfork};
 use reth_execution_types::{Chain, ExecutionOutcome};
 use reth_primitives::{
     constants::{EIP1559_INITIAL_BASE_FEE, EMPTY_ROOT_HASH},
-    proofs::{calculate_receipt_root, calculate_transaction_root},
+    proofs::{calculate_receipt_root, calculate_transaction_root, calculate_withdrawals_root},
     Address, BlockNumber, Header, Receipt, Receipts, Requests, SealedBlock, SealedBlockWithSenders,
     Signature, Transaction, TransactionSigned, TransactionSignedEcRecovered, TxEip1559, B256, U256,
 };
@@ -26,6 +28,8 @@ use tokio::sync::broadcast::{self, Sender};
 pub struct TestBlockBuilder {
     /// The account that signs all the block's transactions.
     pub signer: Address,
+    /// Private key for signing.
+    pub signer_pk: PrivateKeySigner,
     /// Keeps track of signer's account info after execution, will be updated in
     /// methods related to block execution.
     pub signer_execute_account_info: AccountInfo,
@@ -39,9 +43,12 @@ pub struct TestBlockBuilder {
 impl Default for TestBlockBuilder {
     fn default() -> Self {
         let initial_account_info = AccountInfo::from_balance(U256::from(10).pow(U256::from(18)));
+        let signer_pk = PrivateKeySigner::random();
+        let signer = signer_pk.address();
         Self {
             chain_spec: ChainSpec::default(),
-            signer: Address::random(),
+            signer,
+            signer_pk,
             signer_execute_account_info: initial_account_info.clone(),
             signer_build_account_info: initial_account_info,
         }
@@ -49,9 +56,11 @@ impl Default for TestBlockBuilder {
 }
 
 impl TestBlockBuilder {
-    /// Signer setter.
-    pub const fn with_signer(mut self, signer: Address) -> Self {
-        self.signer = signer;
+    /// Signer pk setter.
+    pub fn with_signer_pk(mut self, signer_pk: PrivateKeySigner) -> Self {
+        self.signer = signer_pk.address();
+        self.signer_pk = signer_pk;
+
         self
     }
 
@@ -75,17 +84,25 @@ impl TestBlockBuilder {
         let mut rng = thread_rng();
 
         let mock_tx = |nonce: u64| -> TransactionSignedEcRecovered {
+            let tx = Transaction::Eip1559(TxEip1559 {
+                chain_id: self.chain_spec.chain.id(),
+                nonce,
+                gas_limit: 21_000,
+                to: Address::random().into(),
+                max_fee_per_gas: EIP1559_INITIAL_BASE_FEE as u128,
+                max_priority_fee_per_gas: 1,
+                ..Default::default()
+            });
+            let signature_hash = tx.signature_hash();
+            let signature = self.signer_pk.sign_hash_sync(&signature_hash).unwrap();
+
             TransactionSigned::from_transaction_and_signature(
-                Transaction::Eip1559(TxEip1559 {
-                    chain_id: self.chain_spec.chain.id(),
-                    nonce,
-                    gas_limit: 21_000,
-                    to: Address::random().into(),
-                    max_fee_per_gas: EIP1559_INITIAL_BASE_FEE as u128,
-                    max_priority_fee_per_gas: 1,
-                    ..Default::default()
-                }),
-                Signature::default(),
+                tx,
+                Signature {
+                    r: signature.r(),
+                    s: signature.s(),
+                    odd_y_parity: signature.v().y_parity(),
+                },
             )
             .with_signer(self.signer)
         };
@@ -138,6 +155,13 @@ impl TestBlockBuilder {
                     EMPTY_ROOT_HASH,
                 ),
             )])),
+            // use the number as the timestamp so it is monotonically increasing
+            timestamp: number +
+                EthereumHardfork::Cancun.activation_timestamp(self.chain_spec.chain).unwrap(),
+            withdrawals_root: Some(calculate_withdrawals_root(&[])),
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
+            parent_beacon_block_root: Some(B256::random()),
             ..Default::default()
         };
 
@@ -145,7 +169,7 @@ impl TestBlockBuilder {
             header: header.seal_slow(),
             body: transactions.into_iter().map(|tx| tx.into_signed()).collect(),
             ommers: Vec::new(),
-            withdrawals: None,
+            withdrawals: Some(vec![].into()),
             requests: None,
         };
 
@@ -224,6 +248,46 @@ impl TestBlockBuilder {
             parent_hash = block.block.hash();
             block
         })
+    }
+
+    /// Returns the execution outcome for a block created with this builder.
+    /// In order to properly include the bundle state, the signer balance is
+    /// updated.
+    pub fn get_execution_outcome(&mut self, block: SealedBlockWithSenders) -> ExecutionOutcome {
+        let receipts = block
+            .body
+            .iter()
+            .enumerate()
+            .map(|(idx, tx)| Receipt {
+                tx_type: tx.tx_type(),
+                success: true,
+                cumulative_gas_used: (idx as u64 + 1) * 21_000,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+
+        let mut bundle_state_builder = BundleState::builder(block.number..=block.number);
+
+        for tx in &block.body {
+            self.signer_execute_account_info.balance -= Self::single_tx_cost();
+            bundle_state_builder = bundle_state_builder.state_present_account_info(
+                self.signer,
+                AccountInfo {
+                    nonce: tx.nonce(),
+                    balance: self.signer_execute_account_info.balance,
+                    ..Default::default()
+                },
+            );
+        }
+
+        let execution_outcome = ExecutionOutcome::new(
+            bundle_state_builder.build(),
+            vec![vec![None]].into(),
+            block.number,
+            Vec::new(),
+        );
+
+        execution_outcome.with_receipts(Receipts::from(receipts))
     }
 }
 /// A test `ChainEventSubscriptions`
